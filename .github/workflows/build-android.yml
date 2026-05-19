@@ -1,0 +1,213 @@
+name: Build Android VNC Server APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, main ]
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout LibVNCserver
+        uses: actions/checkout@v4
+        with:
+          repository: LibVNC/libvncserver
+          ref: master
+          path: libvncserver
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Cross-compile LibVNCserver for Android (arm64)
+        run: |
+          cd libvncserver
+          mkdir build-android && cd build-android
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DWITH_JPEG=OFF \
+            -DWITH_PNG=OFF \
+            -DWITH_SDL=OFF \
+            -DWITH_GTK=OFF \
+            -DWITH_TLS=OFF
+          make -j$(nproc)
+
+      - name: Verify native binary
+        run: |
+          file libvncserver/build-android/examples/server/androidvncserver
+          ls -lh libvncserver/build-android/examples/server/androidvncserver
+
+      - name: Strip native binary
+        run: |
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+            libvncserver/build-android/examples/server/androidvncserver \
+            -o libvncserver/build-android/androidvncserver-stripped
+
+      - name: Create Android Project
+        run: |
+          PROJECT=VncServerApp
+          mkdir -p $PROJECT/app/src/main/java/com/example/vncserver
+          mkdir -p $PROJECT/app/src/main/res/{values,layout}
+          mkdir -p $PROJECT/app/src/main/jniLibs/arm64-v8a
+
+          # Copy native lib
+          cp libvncserver/build-android/androidvncserver-stripped \
+            $PROJECT/app/src/main/jniLibs/arm64-v8a/libvncserver.so
+
+          # AndroidManifest.xml
+          cat > $PROJECT/app/src/main/AndroidManifest.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.example.vncserver"
+              android:versionCode="1"
+              android:versionName="1.0">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
+              <application android:label="VNC Server" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          # MainActivity.java
+          cat > $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java << 'JEOF'
+          package com.example.vncserver;
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.widget.*;
+          import android.view.View;
+          import java.net.*;
+          
+          public class MainActivity extends Activity {
+              private TextView statusText;
+              private Process vncProcess;
+              static { System.loadLibrary("vncserver"); }
+              
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  LinearLayout layout = new LinearLayout(this);
+                  layout.setOrientation(LinearLayout.VERTICAL);
+                  layout.setPadding(40,40,40,40);
+                  
+                  TextView title = new TextView(this);
+                  title.setText("LibVNC Server (Android)");
+                  title.setTextSize(24);
+                  layout.addView(title);
+                  
+                  statusText = new TextView(this);
+                  try {
+                      String ip = getLocalIpAddress();
+                      statusText.setText("Ready\nIP: " + ip + "\nPort: 5900");
+                  } catch (Exception e) {
+                      statusText.setText("Ready");
+                  }
+                  layout.addView(statusText);
+                  
+                  Button startBtn = new Button(this);
+                  startBtn.setText("Start VNC Server");
+                  startBtn.setOnClickListener(v -> startVnc());
+                  layout.addView(startBtn);
+                  
+                  Button stopBtn = new Button(this);
+                  stopBtn.setText("Stop");
+                  stopBtn.setOnClickListener(v -> stopVnc());
+                  layout.addView(stopBtn);
+                  
+                  setContentView(layout);
+              }
+              
+              private void startVnc() {
+                  try {
+                      String libPath = getApplicationInfo().nativeLibraryDir;
+                      vncProcess = new ProcessBuilder(libPath + "/libvncserver.so")
+                          .redirectErrorStream(true).start();
+                      statusText.setText("VNC Server running\nConnect to port 5900");
+                  } catch (Exception e) {
+                      statusText.setText("Error: " + e.getMessage());
+                  }
+              }
+              
+              private void stopVnc() {
+                  if (vncProcess != null) { vncProcess.destroy(); vncProcess = null; }
+                  statusText.setText("Stopped");
+              }
+              
+              private String getLocalIpAddress() throws Exception {
+                  for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                      for (InetAddress addr : Collections.list(ni.getInetAddresses())) {
+                          if (!addr.isLoopbackAddress() && addr instanceof Inet4Address)
+                              return addr.getHostAddress();
+                      }
+                  }
+                  return "unknown";
+              }
+          }
+          JEOF
+
+          # Build APK with aapt
+          BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
+          PLATFORM=$ANDROID_HOME/platforms/android-34/android.jar
+          
+          # Compile resources
+          $BUILD_TOOLS/aapt package -f \
+            -M $PROJECT/app/src/main/AndroidManifest.xml \
+            -S $PROJECT/app/src/main/res \
+            -I $PLATFORM \
+            -F $PROJECT/resources.apk
+          
+          # Compile Java
+          mkdir -p obj
+          javac -classpath $PLATFORM -source 1.8 -target 1.8 \
+            -d obj $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java
+          
+          # Convert to DEX
+          $BUILD_TOOLS/d8 --output $PROJECT obj/com/example/vncserver/*.class \
+            $PLATFORM
+          
+          # Build APK
+          cd $PROJECT
+          cp resources.apk vncserver-unsigned.apk
+          $BUILD_TOOLS/aapt add vncserver-unsigned.apk classes.dex
+          cd jniLibs && $BUILD_TOOLS/aapt add ../vncserver-unsigned.apk arm64-v8a/libvncserver.so && cd ..
+          
+          # Align & sign
+          $BUILD_TOOLS/zipalign -f 4 vncserver-unsigned.apk vncserver-aligned.apk
+          keytool -genkey -v -keystore debug.keystore -storepass android \
+            -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Debug,O=Android,C=US"
+          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android \
+            --key-pass pass:android --out vncserver-debug.apk vncserver-aligned.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vncserver-android-apk
+          path: VncServerApp/vncserver-debug.apk
+          retention-days: 30
