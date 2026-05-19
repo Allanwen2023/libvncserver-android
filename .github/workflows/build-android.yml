@@ -31,6 +31,10 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Install SDK components
+        run: |
+          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0" 2>/dev/null
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -60,21 +64,20 @@ jobs:
         run: |
           $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             libvncserver/build-android/examples/server/androidvncserver \
-            -o libvncserver/build-android/androidvncserver-stripped
+            -o androidvncserver-stripped
 
-      - name: Create Android Project
+      - name: Create Android Project and Build APK
         run: |
           PROJECT=VncServerApp
           mkdir -p $PROJECT/app/src/main/java/com/example/vncserver
-          mkdir -p $PROJECT/app/src/main/res/{values,layout}
+          mkdir -p $PROJECT/app/src/main/res/values
           mkdir -p $PROJECT/app/src/main/jniLibs/arm64-v8a
 
           # Copy native lib
-          cp libvncserver/build-android/androidvncserver-stripped \
-            $PROJECT/app/src/main/jniLibs/arm64-v8a/libvncserver.so
+          cp androidvncserver-stripped $PROJECT/app/src/main/jniLibs/arm64-v8a/libvncserver.so
 
           # AndroidManifest.xml
-          cat > $PROJECT/app/src/main/AndroidManifest.xml << 'EOF'
+          cat > $PROJECT/app/src/main/AndroidManifest.xml << 'XMLEND'
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
               package="com.example.vncserver"
@@ -93,17 +96,18 @@ jobs:
                   </activity>
               </application>
           </manifest>
-          EOF
+          XMLEND
 
           # MainActivity.java
-          cat > $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java << 'JEOF'
+          cat > $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java << 'JAVAEND'
           package com.example.vncserver;
           import android.app.Activity;
           import android.os.Bundle;
           import android.widget.*;
           import android.view.View;
           import java.net.*;
-          
+          import java.util.*;
+
           public class MainActivity extends Activity {
               private TextView statusText;
               private Process vncProcess;
@@ -169,27 +173,34 @@ jobs:
                   return "unknown";
               }
           }
-          JEOF
+          JAVAEND
 
-          # Build APK with aapt
+          # Build APK with aapt/d8
           BUILD_TOOLS=$ANDROID_HOME/build-tools/34.0.0
-          PLATFORM=$ANDROID_HOME/platforms/android-34/android.jar
+          PLATFORM_JAR=$ANDROID_HOME/platforms/android-34/android.jar
+          
+          echo "=== Building APK ==="
+          echo "BUILD_TOOLS=$BUILD_TOOLS"
+          echo "PLATFORM_JAR=$PLATFORM_JAR"
+          ls -la $BUILD_TOOLS/aapt || echo "aapt not found"
+          ls -la $PLATFORM_JAR || echo "platform jar not found"
           
           # Compile resources
           $BUILD_TOOLS/aapt package -f \
             -M $PROJECT/app/src/main/AndroidManifest.xml \
             -S $PROJECT/app/src/main/res \
-            -I $PLATFORM \
+            -I $PLATFORM_JAR \
             -F $PROJECT/resources.apk
           
           # Compile Java
           mkdir -p obj
-          javac -classpath $PLATFORM -source 1.8 -target 1.8 \
+          javac -classpath $PLATFORM_JAR -source 1.8 -target 1.8 \
             -d obj $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java
           
           # Convert to DEX
-          $BUILD_TOOLS/d8 --output $PROJECT obj/com/example/vncserver/*.class \
-            $PLATFORM
+          $BUILD_TOOLS/d8 --output $PROJECT \
+            --lib $PLATFORM_JAR \
+            obj/com/example/vncserver/*.class
           
           # Build APK
           cd $PROJECT
@@ -204,6 +215,9 @@ jobs:
             -validity 10000 -dname "CN=Debug,O=Android,C=US"
           $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android \
             --key-pass pass:android --out vncserver-debug.apk vncserver-aligned.apk
+          
+          echo "=== APK built ==="
+          ls -lh vncserver-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
