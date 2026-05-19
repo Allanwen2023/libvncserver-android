@@ -64,17 +64,17 @@ jobs:
         run: |
           $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
             libvncserver/build-android/examples/server/androidvncserver \
-            -o androidvncserver-stripped
+            -o androidvncserver
 
       - name: Create Android Project and Build APK
         run: |
           PROJECT=VncServerApp
           mkdir -p $PROJECT/app/src/main/java/com/example/vncserver
           mkdir -p $PROJECT/app/src/main/res/values
-          mkdir -p $PROJECT/app/src/main/jniLibs/arm64-v8a
+          mkdir -p $PROJECT/app/src/main/assets
 
-          # Copy native lib
-          cp androidvncserver-stripped $PROJECT/app/src/main/jniLibs/arm64-v8a/libvncserver.so
+          # Copy native executable to assets (will be extracted at runtime)
+          cp androidvncserver $PROJECT/app/src/main/assets/
 
           # AndroidManifest.xml
           cat > $PROJECT/app/src/main/AndroidManifest.xml << 'XMLEND'
@@ -86,6 +86,8 @@ jobs:
               <uses-permission android:name="android.permission.INTERNET"/>
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
               <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
               <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="34"/>
               <application android:label="VNC Server" android:theme="@android:style/Theme.Material.Light">
                   <activity android:name=".MainActivity" android:exported="true">
@@ -98,20 +100,24 @@ jobs:
           </manifest>
           XMLEND
 
-          # MainActivity.java
+          # MainActivity.java - Extract executable and run it
           cat > $PROJECT/app/src/main/java/com/example/vncserver/MainActivity.java << 'JAVAEND'
           package com.example.vncserver;
           import android.app.Activity;
           import android.os.Bundle;
           import android.widget.*;
           import android.view.View;
+          import android.util.Log;
+          import java.io.*;
           import java.net.*;
           import java.util.*;
 
           public class MainActivity extends Activity {
+              private static final String TAG = "VncServer";
               private TextView statusText;
+              private EditText portEdit;
               private Process vncProcess;
-              static { System.loadLibrary("vncserver"); }
+              private File execFile;
               
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -125,10 +131,23 @@ jobs:
                   title.setTextSize(24);
                   layout.addView(title);
                   
+                  // Port input
+                  LinearLayout portRow = new LinearLayout(this);
+                  portRow.setOrientation(LinearLayout.HORIZONTAL);
+                  TextView portLabel = new TextView(this);
+                  portLabel.setText("Port: ");
+                  portRow.addView(portLabel);
+                  portEdit = new EditText(this);
+                  portEdit.setText("5900");
+                  portEdit.setInputType(2); // number
+                  portRow.addView(portEdit);
+                  layout.addView(portRow);
+                  
                   statusText = new TextView(this);
+                  statusText.setPadding(0,20,0,0);
                   try {
                       String ip = getLocalIpAddress();
-                      statusText.setText("Ready\nIP: " + ip + "\nPort: 5900");
+                      statusText.setText("Ready\nIP: " + ip);
                   } catch (Exception e) {
                       statusText.setText("Ready");
                   }
@@ -145,22 +164,84 @@ jobs:
                   layout.addView(stopBtn);
                   
                   setContentView(layout);
+                  
+                  // Extract executable on startup
+                  new Thread(() -> extractExecutable()).start();
+              }
+              
+              private void extractExecutable() {
+                  try {
+                      File dir = new File(getFilesDir(), "bin");
+                      dir.mkdirs();
+                      execFile = new File(dir, "androidvncserver");
+                      
+                      if (!execFile.exists()) {
+                          InputStream is = getAssets().open("androidvncserver");
+                          FileOutputStream os = new FileOutputStream(execFile);
+                          byte[] buf = new byte[8192];
+                          int len;
+                          while ((len = is.read(buf)) > 0) os.write(buf, 0, len);
+                          os.close();
+                          is.close();
+                      }
+                      
+                      // Make executable
+                      execFile.setExecutable(true);
+                      Log.i(TAG, "Executable extracted: " + execFile.getAbsolutePath());
+                      runOnUiThread(() -> statusText.append("\nBinary ready: " + execFile.length() + " bytes"));
+                  } catch (Exception e) {
+                      Log.e(TAG, "Failed to extract executable", e);
+                      runOnUiThread(() -> statusText.setText("Error: " + e.getMessage()));
+                  }
               }
               
               private void startVnc() {
+                  if (execFile == null || !execFile.exists()) {
+                      statusText.setText("Binary not ready, please wait...");
+                      return;
+                  }
+                  
                   try {
-                      String libPath = getApplicationInfo().nativeLibraryDir;
-                      vncProcess = new ProcessBuilder(libPath + "/libvncserver.so")
-                          .redirectErrorStream(true).start();
-                      statusText.setText("VNC Server running\nConnect to port 5900");
+                      String port = portEdit.getText().toString();
+                      
+                      // Run the native executable
+                      ProcessBuilder pb = new ProcessBuilder(
+                          execFile.getAbsolutePath(),
+                          "-p", port
+                      );
+                      pb.redirectErrorStream(true);
+                      vncProcess = pb.start();
+                      
+                      // Read output in background
+                      new Thread(() -> {
+                          try {
+                              BufferedReader reader = new BufferedReader(
+                                  new InputStreamReader(vncProcess.getInputStream()));
+                              String line;
+                              while ((line = reader.readLine()) != null) {
+                                  Log.i(TAG, line);
+                                  final String l = line;
+                                  runOnUiThread(() -> statusText.append("\n" + l));
+                              }
+                          } catch (IOException e) {
+                              Log.e(TAG, "Error reading output", e);
+                          }
+                      }).start();
+                      
+                      String ip = getLocalIpAddress();
+                      statusText.setText("VNC Server running\nConnect to " + ip + ":" + port);
                   } catch (Exception e) {
+                      Log.e(TAG, "Failed to start VNC server", e);
                       statusText.setText("Error: " + e.getMessage());
                   }
               }
               
               private void stopVnc() {
-                  if (vncProcess != null) { vncProcess.destroy(); vncProcess = null; }
-                  statusText.setText("Stopped");
+                  if (vncProcess != null) {
+                      vncProcess.destroy();
+                      vncProcess = null;
+                      statusText.setText("Stopped");
+                  }
               }
               
               private String getLocalIpAddress() throws Exception {
@@ -180,15 +261,12 @@ jobs:
           PLATFORM_JAR=$ANDROID_HOME/platforms/android-34/android.jar
           
           echo "=== Building APK ==="
-          echo "BUILD_TOOLS=$BUILD_TOOLS"
-          echo "PLATFORM_JAR=$PLATFORM_JAR"
-          ls -la $BUILD_TOOLS/aapt || echo "aapt not found"
-          ls -la $PLATFORM_JAR || echo "platform jar not found"
           
           # Compile resources
           $BUILD_TOOLS/aapt package -f \
             -M $PROJECT/app/src/main/AndroidManifest.xml \
             -S $PROJECT/app/src/main/res \
+            -A $PROJECT/app/src/main/assets \
             -I $PLATFORM_JAR \
             -F $PROJECT/resources.apk
           
@@ -206,7 +284,6 @@ jobs:
           cd $PROJECT
           cp resources.apk vncserver-unsigned.apk
           $BUILD_TOOLS/aapt add vncserver-unsigned.apk classes.dex
-          cd jniLibs && $BUILD_TOOLS/aapt add ../vncserver-unsigned.apk arm64-v8a/libvncserver.so && cd ..
           
           # Align & sign
           $BUILD_TOOLS/zipalign -f 4 vncserver-unsigned.apk vncserver-aligned.apk
